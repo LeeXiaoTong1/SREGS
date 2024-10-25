@@ -1,0 +1,4 @@
+# ninja log v5
+2	21665	1725596727381317000	/media/zgy/data/lxt/FSGS-base/submodules/simple-knn/build/temp.linux-x86_64-cpython-38/simple_knn.o	45518270748ad0bf
+2	29545	1725596735224794400	/media/zgy/data/lxt/FSGS-base/submodules/simple-knn/build/temp.linux-x86_64-cpython-38/ext.o	506126d9db7ea80a
+3	52732	1725596758440976000	/media/zgy/data/lxt/FSGS-base/submodules/simple-knn/build/temp.linux-x86_64-cpython-38/spatial.o	5be2ef89df6d42f3
