@@ -41,7 +41,7 @@ Place the downloaded weights in the `checkp` directory.
 ## Training
 LLFF datasets.
 ``` 
-python train_llff.py  -s/nerf_llff_data/trex -m output/trex --eval --n_views 3
+python train_llff.py  -s dataset/nerf_llff_data/trex -m output/trex --eval --n_views 3
 ```
 
 MipNerf360 datasets
