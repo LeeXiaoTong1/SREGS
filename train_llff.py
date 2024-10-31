@@ -187,13 +187,7 @@ def training(dataset, opt, pipe, args, depth_model):
         if iteration > args.end_sample_pseudo:
             args.depth_weight = 0.001
 
-        depth_n = render_pkg["depth"][0].unsqueeze(0)
-        anyth_n = midas_depth.unsqueeze(0)
-
-        anyth_n = 255.0 - anyth_n
-
-        loss_l2_dpt = patch_norm_mse_loss(depth_n[None, ...], anyth_n[None, ...],
-                                          randint(patch_range[0], patch_range[1]), opt.error_tolerance)
+     
         loss += 0.01 * loss_l2_dpt
 
         loss.backward()
