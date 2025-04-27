@@ -166,13 +166,13 @@ def vis_depth(depth):
         depth, np.ones_like(depth), [50 - percentile / 2, 50 + percentile / 2])
     lo = None or (lo_auto - eps)
     hi = None or (hi_auto + eps)
-    # curve_fn = lambda x: 1/x + eps
-    curve_fn = lambda x: x + eps
+    curve_fn = lambda x: 1/x + eps
+    # curve_fn = lambda x: x + eps
 
     depth, lo, hi = [curve_fn(x) for x in [depth, lo, hi]]
     depth = np.nan_to_num(
             np.clip((depth - np.minimum(lo, hi)) / np.abs(hi - lo), 0, 1))
-    colorized = cm.get_cmap('viridis')(depth)[:, :, :3]
+    colorized = cm.get_cmap('turbo')(depth)[:, :, :3]
 
     return np.uint8(colorized[..., ::-1] * 255)
 
