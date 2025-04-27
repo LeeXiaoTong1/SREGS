@@ -10,7 +10,6 @@
 #
 try:
     from torch.utils.tensorboard import SummaryWriter
-
     TENSORBOARD_FOUND = True
 except ImportError:
     TENSORBOARD_FOUND = False
@@ -44,7 +43,6 @@ from depth_anything_v2.dpt import DepthAnythingV2
 
 DEVICE = 'cuda' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu'
 
-
 # 加载模型
 def load_depth_model(mode='vitl'):
     model_configs = {
@@ -58,10 +56,9 @@ def load_depth_model(mode='vitl'):
     model.load_state_dict(torch.load(f'checkp/depth_anything_v2_{mode}.pth', map_location='cpu'))
     model = model.to(DEVICE).eval()
     return model
-
-
 # 在训练开始时加载模型
 depth_model = load_depth_model('vitl')
+
 
 
 def save_depth_image(depth, filename):
@@ -71,9 +68,10 @@ def save_depth_image(depth, filename):
     plt.imsave(filename, depth, cmap='gray')
 
 
+
 def training(dataset, opt, pipe, args, depth_model):
     testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from = args.test_iterations, \
-        args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from
+            args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
     gaussians = GaussianModel(args)
@@ -82,6 +80,7 @@ def training(dataset, opt, pipe, args, depth_model):
     if checkpoint:
         (model_params, first_iter) = torch.load(checkpoint)
         gaussians.restore(model_params, opt)
+
 
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
@@ -102,8 +101,7 @@ def training(dataset, opt, pipe, args, depth_model):
                 custom_cam, do_training, pipe.convert_SHs_python, pipe.compute_cov3D_python, keep_alive, scaling_modifer = network_gui.receive()
                 if custom_cam != None:
                     net_image = render(custom_cam, gaussians, pipe, background, scaling_modifer)["render"]
-                    net_image_bytes = memoryview((torch.clamp(net_image, min=0, max=1.0) * 255).byte().permute(1, 2,
-                                                                                                               0).contiguous().cpu().numpy())
+                    net_image_bytes = memoryview((torch.clamp(net_image, min=0, max=1.0) * 255).byte().permute(1, 2, 0).contiguous().cpu().numpy())
                 network_gui.send(net_image_bytes, dataset.source_path)
                 if do_training and ((iteration < int(opt.iterations)) or not keep_alive):
                     break
@@ -126,34 +124,41 @@ def training(dataset, opt, pipe, args, depth_model):
             pipe.debug = True
 
         render_pkg = render(viewpoint_cam, gaussians, pipe, background)
-        image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], \
-        render_pkg["visibility_filter"], render_pkg["radii"]
+        image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
 
         # Loss
         gt_image = viewpoint_cam.original_image.cuda()
 
-        Ll1 = l1_loss_mask(image, gt_image)
+        Ll1 =  l1_loss_mask(image, gt_image)
         loss = ((1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image)))
-
+        
+        
         # regularization
-        # lambda_normal = opt.lambda_normal if iteration > 4000 else 0.0
         lambda_normal = opt.lambda_normal if iteration > 2000 else 0.0
+        # lambda_normal = opt.lambda_normal if iteration > 2000 else 0.0
+        lambda_dist = opt.lambda_dist if iteration > 6000 else 0.0
 
-        rend_normal = render_pkg['rend_normal']
+        rend_dist = render_pkg["rend_dist"]
+        rend_normal  = render_pkg['rend_normal']
         surf_normal = render_pkg['surf_normal']
         normal_error = (1 - (rend_normal * surf_normal).sum(dim=0))[None]
         normal_loss = lambda_normal * (normal_error).mean()
-
+        dist_loss = lambda_dist * (rend_dist).mean()
+        
+        # loss = loss + dist_loss + normal_loss
+        # loss = loss + dist_loss
         loss = loss + normal_loss
 
         loss = loss + args.opacity_reg * torch.abs(gaussians.get_opacity).mean()
+        # loss = loss + args.scale_reg * torch.abs(gaussians.get_scaling).mean()
+
         rendered_depth = render_pkg["depth"][0]
         midas_depth = torch.tensor(viewpoint_cam.depth_image).cuda().squeeze()
 
         # print(
         #     f"Iteration {iteration}: midas_depth shape: {midas_depth.shape}, rendered_depth shape: {rendered_depth.shape}")
         if iteration % 1000 == 0:
-            #     save_depth_image(midas_depth, f'midas_depth_{iteration}.png')
+        #     save_depth_image(midas_depth, f'midas_depth_{iteration}.png')
             save_depth_image(rendered_depth, f'rendered_depth_{iteration}.png')
 
         # Ensure both depths have the same dimensions
@@ -171,14 +176,23 @@ def training(dataset, opt, pipe, args, depth_model):
             (1 - pearson_corrcoef(-midas_depth_t, rendered_depth)),
             (1 - pearson_corrcoef(1 / (midas_depth_t + 200.), rendered_depth))
         )
-        loss += args.depth_weight * depth_loss
+        # loss += args.depth_weight * depth_loss
 
         if iteration > args.end_sample_pseudo:
             args.depth_weight = 0.001
+            
+        
+        patch_range = (5, 17)
+        depth_n = render_pkg["depth"][0].unsqueeze(0)
+        anyth_n = midas_depth.unsqueeze(0)
+#         print(depth_n.shape)
+#         print(anyth_n.shape)
+        
+        anyth_n = 255.0 - anyth_n
+        
+        loss_l2_dpt = patch_norm_mse_loss(depth_n[None,...], anyth_n[None,...], randint(patch_range[0], patch_range[1]), opt.error_tolerance)
+        # loss += 0.03 * loss_l2_dpt     
 
-        patch_range = (5, 16)
-     
-        loss += 0.01 * loss_l2_dpt
 
         loss.backward()
 
@@ -205,48 +219,58 @@ def training(dataset, opt, pipe, args, depth_model):
                            scene.model_path + "/chkpnt" + str(iteration) + ".pth")
 
             # Densification
-            if iteration < opt.densify_until_iter:
+            if  iteration < opt.densify_until_iter:
                 # Keep track of max radii in image-space for pruning
-                gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter],
-                                                                     radii[visibility_filter])
+                gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
                 gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
-
+            
                 if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
                     size_threshold = None
-                    gaussians.densify_and_prune(opt.densify_grad_threshold, opt.prune_threshold, scene.cameras_extent,
-                                                size_threshold, iteration)
+                    gaussians.densify_and_prune(opt.densify_grad_threshold, opt.prune_threshold, scene.cameras_extent, size_threshold, iteration)
+
+#             if iteration < opt.densify_until_iter and iteration > 500 and iteration % opt.densification_interval == 0:
+#                 dead_mask = (gaussians.get_opacity <= 0.002).squeeze(-1)
+#                 gaussians.relocate_gs(dead_mask=dead_mask)
+#                 gaussians.add_new_gs(cap_max=args.cap_max)
 
             # Optimizer step
             if iteration < opt.iterations:
                 gaussians.optimizer.step()
-                gaussians.optimizer.zero_grad(set_to_none=True)
-
+                gaussians.optimizer.zero_grad(set_to_none = True)
+                
+                
                 def get_dynamic_noise_scale(iteration, min_value=0.0001, max_value=0.005, max_iter=2000):
+ 
                     # 确保 noise_scale 始终在 min_value 和 max_value 之间变化
-                    progress = min(1, iteration / max_iter)
-                    return min_value + (max_value - min_value) * progress
-
+                    progress = min(1 , iteration / max_iter)
+                    return min_value + (max_value - min_value) * progress    
+                
                 L = build_scaling_rotation(
-                    torch.cat([gaussians.get_scaling, torch.ones_like(gaussians.get_scaling)], dim=-1),
-                    gaussians.get_rotation).permute(0, 2, 1)
+    torch.cat([gaussians.get_scaling , torch.ones_like(gaussians.get_scaling)], dim=-1), gaussians.get_rotation).permute(0, 2, 1)
 
                 actual_covariance = L @ L.transpose(1, 2)
 
                 def op_sigmoid(x, k=100, x0=0.995):
                     return 1 / (1 + torch.exp(-k * (x - x0)))
-
+                
                 # 动态计算 noise_scale
-                noise_scale = get_dynamic_noise_scale(iteration, min_value=0.00001, max_value=0.001, max_iter=5000)
+                # noise_scale = get_dynamic_noise_scale(iteration, min_value=0.5, max_value=5000, max_iter=5000)
+                # noise_scale = get_dynamic_noise_scale(iteration, min_value=0.0001, max_value=0.01, max_iter=9500)
+                noise_scale = get_dynamic_noise_scale(iteration, min_value=0.0001, max_value=0.02, max_iter=9500)
 
+
+                # noise = torch.randn_like(gaussians._xyz) * (
+                #     op_sigmoid(1 - gaussians.get_opacity)) * xyz_lr * noise_scale
                 noise = torch.randn_like(gaussians._xyz) * (
-                    op_sigmoid(1 - gaussians.get_opacity)) * args.noise_lr * xyz_lr * noise_scale
-
+                    op_sigmoid(1 - gaussians.get_opacity)) * xyz_lr * noise_scale* args.noise_lr
+                
                 noise = torch.bmm(actual_covariance, noise.unsqueeze(-1)).squeeze(-1)
-                gaussians._xyz.add_(noise)
-
+                # gaussians._xyz.add_(noise)
+           
+                
                 # if iteration % 1000 == 0:
                 #     print(f"After adding noise, gaussians._xyz: {gaussians._xyz}")
-
+              
             gaussians.update_learning_rate(iteration)
             if (iteration - args.start_sample_pseudo - 1) % opt.opacity_reset_interval == 0 and \
                     iteration > args.start_sample_pseudo:
@@ -256,14 +280,14 @@ def training(dataset, opt, pipe, args, depth_model):
 def prepare_output_and_logger(args):
     if not args.model_path:
         if os.getenv('OAR_JOB_ID'):
-            unique_str = os.getenv('OAR_JOB_ID')
+            unique_str=os.getenv('OAR_JOB_ID')
         else:
             unique_str = str(uuid.uuid4())
         args.model_path = os.path.join("./output/", unique_str[0:10])
 
     # Set up output folder
     print("Output folder: {}".format(args.model_path))
-    os.makedirs(args.model_path, exist_ok=True)
+    os.makedirs(args.model_path, exist_ok = True)
     with open(os.path.join(args.model_path, "cfg_args"), 'w') as cfg_log_f:
         cfg_log_f.write(str(Namespace(**vars(args))))
 
@@ -276,7 +300,8 @@ def prepare_output_and_logger(args):
     return tb_writer
 
 
-def training_report(tb_writer, iteration, Ll1, loss, l1_loss, testing_iterations, scene: Scene, renderFunc, renderArgs):
+
+def training_report(tb_writer, iteration, Ll1, loss, l1_loss, testing_iterations, scene : Scene, renderFunc, renderArgs):
     if tb_writer:
         tb_writer.add_scalar('train_loss_patches/l1_loss', Ll1.item(), iteration)
         tb_writer.add_scalar('train_loss_patches/total_loss', loss.item(), iteration)
@@ -285,8 +310,8 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, testing_iterations
     # Report test and samples of training set
     if iteration in testing_iterations:
         torch.cuda.empty_cache()
-        validation_configs = ({'name': 'test', 'cameras': scene.getTestCameras()},
-                              {'name': 'train', 'cameras': scene.getTrainCameras()})
+        validation_configs = ({'name': 'test', 'cameras' : scene.getTestCameras()},
+                              {'name': 'train', 'cameras' : scene.getTrainCameras()})
 
         for config in validation_configs:
             if config['cameras'] and len(config['cameras']) > 0:
@@ -295,11 +320,9 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, testing_iterations
                     image = torch.clamp(renderFunc(viewpoint, scene.gaussians, *renderArgs)["render"], 0.0, 1.0)
                     gt_image = torch.clamp(viewpoint.original_image.to("cuda"), 0.0, 1.0)
                     if tb_writer and (idx < 8):
-                        tb_writer.add_images(config['name'] + "_view_{}/render".format(viewpoint.image_name),
-                                             image[None], global_step=iteration)
+                        tb_writer.add_images(config['name'] + "_view_{}/render".format(viewpoint.image_name), image[None], global_step=iteration)
                         if iteration == testing_iterations[0]:
-                            tb_writer.add_images(config['name'] + "_view_{}/ground_truth".format(viewpoint.image_name),
-                                                 gt_image[None], global_step=iteration)
+                            tb_writer.add_images(config['name'] + "_view_{}/ground_truth".format(viewpoint.image_name), gt_image[None], global_step=iteration)
                     l1_test += l1_loss(image, gt_image).mean().double()
 
                     _mask = None
@@ -324,7 +347,6 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, testing_iterations
             tb_writer.add_scalar('total_points', scene.gaussians.get_xyz.shape[0], iteration)
         torch.cuda.empty_cache()
 
-
 if __name__ == "__main__":
     # Set up command line argument parser
     parser = ArgumentParser(description="Training")
@@ -340,7 +362,7 @@ if __name__ == "__main__":
     parser.add_argument("--save_iterations", nargs="+", type=int, default=[5000, 10000])
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[5000, 10000])
-    parser.add_argument("--start_checkpoint", type=str, default=None)
+    parser.add_argument("--start_checkpoint", type=str, default = None)
     parser.add_argument("--train_bg", action="store_true")
     parser.add_argument("--c2f", action="store_true", default=False)
     parser.add_argument("--c2f_every_step", type=float, default=1000,
