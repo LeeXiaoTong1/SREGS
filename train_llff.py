@@ -142,8 +142,6 @@ def training(dataset, opt, pipe, args, depth_model):
 
         rendered_depth = render_pkg["depth"][0]
         midas_depth = torch.tensor(viewpoint_cam.depth_image).cuda().squeeze()
-        
-        # 反转 rendered_depth 的深度值
         max_depth_value = rendered_depth.max()
         rendered_depth_inverted = max_depth_value - rendered_depth
         # print(
@@ -161,17 +159,12 @@ def training(dataset, opt, pipe, args, depth_model):
         ).squeeze()
 
         rendered_depth = rendered_depth.reshape(-1, 1)
-        # rendered_depth_flat = rendered_depth_inverted.reshape(-1, 1)
         midas_depth_t = midas_depth_resized.reshape(-1, 1)
         depth_loss = min(
             (1 - pearson_corrcoef(-midas_depth_t, rendered_depth)),
             (1 - pearson_corrcoef(1 / (midas_depth_t + 200.), rendered_depth))
         )
-        
         loss += args.depth_weight * depth_loss
-
-        if iteration > args.end_sample_pseudo:
-            args.depth_weight = 0.001
   
         depth_n = render_pkg["depth"][0].unsqueeze(0)
         anyth_n = midas_depth.unsqueeze(0)
