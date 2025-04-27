@@ -22,9 +22,6 @@ def savePILImageAsPNG(pil_image, save_path):
     pil_image.save(save_path, format='PNG')
 def loadCam(args, id, cam_info, resolution_scale, depth_model):
     orig_w, orig_h = cam_info.image.size
-    # # 打印 cam_info.image 的形状
-    # print(f"Original image size: {orig_w}x{orig_h}")
-    # print(f"cam_info.image mode: {cam_info.image.mode}")
 
     if args.resolution in [1, 2, 4, 8]:
         resolution = round(orig_w/(resolution_scale * args.resolution)), round(orig_h/(resolution_scale * args.resolution))
@@ -45,15 +42,12 @@ def loadCam(args, id, cam_info, resolution_scale, depth_model):
     scale = float(global_down) * float(resolution_scale)
     resolution = (int(orig_w / scale), int(orig_h / scale))
 
-    # 将 PIL 图像转换为 PNG 文件并读取回来
     temp_dir = "/tmp"
-    temp_image_path = os.path.join(temp_dir, f"{cam_info.image_name}.png")  # 使用原始名称
+    temp_image_path = os.path.join(temp_dir, f"{cam_info.image_name}.png") 
     savePILImageAsPNG(cam_info.image, temp_image_path)
     raw_img = cv2.imread(temp_image_path)
     if raw_img is None:
         raise ValueError(f"Could not load image from temporary file: {temp_image_path}")
-    # 打印 raw_img 的形状
-    # print(f"Raw image shape: {raw_img.shape}")
     depth = estimate_depth(raw_img, depth_model)
 
     resized_image_rgb = PILtoTorch(cam_info.image, resolution)
