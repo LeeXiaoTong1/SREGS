@@ -24,35 +24,36 @@ from utils.general_utils import strip_symmetric, build_scaling_rotation, chamfer
 import open3d as o3d
 from torch.optim.lr_scheduler import MultiStepLR
 
+from sklearn.mixture import GaussianMixture
+
 
 class GaussianModel:
 
-    #     def setup_functions(self):
-    #         def build_covariance_from_scaling_rotation(scaling, scaling_modifier, rotation):
-    #             L = build_scaling_rotation(scaling_modifier * scaling, rotation)
-    #             actual_covariance = L @ L.transpose(1, 2)
-    #             symm = strip_symmetric(actual_covariance)
-    #             return symm
+#     def setup_functions(self):
+#         def build_covariance_from_scaling_rotation(scaling, scaling_modifier, rotation):
+#             L = build_scaling_rotation(scaling_modifier * scaling, rotation)
+#             actual_covariance = L @ L.transpose(1, 2)
+#             symm = strip_symmetric(actual_covariance)
+#             return symm
 
-    #         self.scaling_activation = torch.exp
-    #         self.scaling_inverse_activation = torch.log
+#         self.scaling_activation = torch.exp
+#         self.scaling_inverse_activation = torch.log
 
-    #         self.covariance_activation = build_covariance_from_scaling_rotation
+#         self.covariance_activation = build_covariance_from_scaling_rotation
 
-    #         self.opacity_activation = torch.sigmoid
-    #         self.inverse_opacity_activation = inverse_sigmoid
+#         self.opacity_activation = torch.sigmoid
+#         self.inverse_opacity_activation = inverse_sigmoid
 
-    #         self.rotation_activation = torch.nn.functional.normalize
+#         self.rotation_activation = torch.nn.functional.normalize
     def setup_functions(self):
         def build_covariance_from_scaling_rotation(center, scaling, scaling_modifier, rotation):
-            RS = build_scaling_rotation(torch.cat([scaling * scaling_modifier, torch.ones_like(scaling)], dim=-1),
-                                        rotation).permute(0, 2, 1)
+            RS = build_scaling_rotation(torch.cat([scaling * scaling_modifier, torch.ones_like(scaling)], dim=-1), rotation).permute(0,2,1)
             trans = torch.zeros((center.shape[0], 4, 4), dtype=torch.float, device="cuda")
-            trans[:, :3, :3] = RS
-            trans[:, 3, :3] = center
+            trans[:,:3,:3] = RS
+            trans[:, 3,:3] = center
             trans[:, 3, 3] = 1
             return trans
-
+        
         self.scaling_activation = torch.exp
         self.scaling_inverse_activation = torch.log
 
@@ -73,6 +74,7 @@ class GaussianModel:
         self._rotation = torch.empty(0)
         self._opacity = torch.empty(0)
         self.max_radii2D = torch.empty(0)
+        self.nearest_distance = torch.empty(0)
         self.xyz_gradient_accum = torch.empty(0)
         self.denom = torch.empty(0)
         self.optimizer = None
@@ -92,6 +94,7 @@ class GaussianModel:
             self._rotation,
             self._opacity,
             self.max_radii2D,
+            self.nearest_distance,
             self.xyz_gradient_accum,
             self.denom,
             self.optimizer.state_dict(),
@@ -115,6 +118,9 @@ class GaussianModel:
         self.xyz_gradient_accum = xyz_gradient_accum
         self.denom = denom
         # self.optimizer.load_state_dict(opt_dict)
+    
+    def get_nearest_distance(self):
+        return self.nearest_distance
 
     @property
     def get_scaling(self):
@@ -153,7 +159,7 @@ class GaussianModel:
 
         features = torch.zeros((fused_point_cloud.shape[0], 3, (self.max_sh_degree + 1) ** 2)).float().cuda()
         if self.args.use_color:
-            features[:, :3, 0] = fused_color
+            features[:, :3, 0] =  fused_color
         features[:, 3:, 1:] = 0.0
 
         print("Number of points at initialisation : ", fused_point_cloud.shape[0])
@@ -199,6 +205,7 @@ class GaussianModel:
                                                     lr_delay_mult=training_args.position_lr_delay_mult,
                                                     max_steps=training_args.position_lr_max_steps)
 
+
     def update_learning_rate(self, iteration):
         ''' Learning rate scheduling per step '''
         xyz_lr = self.xyz_scheduler_args(iteration)
@@ -206,6 +213,7 @@ class GaussianModel:
             if param_group["name"] == "xyz":
                 param_group['lr'] = xyz_lr
                 return xyz_lr
+
 
     def construct_list_of_attributes(self):
         l = ['x', 'y', 'z', 'nx', 'ny', 'nz']
@@ -294,6 +302,7 @@ class GaussianModel:
 
         self.active_sh_degree = self.max_sh_degree
 
+
     def replace_tensor_to_optimizer(self, tensor, name):
         optimizable_tensors = {}
         for group in self.optimizer.param_groups:
@@ -344,6 +353,7 @@ class GaussianModel:
         self.denom = self.denom[valid_points_mask]
         self.max_radii2D = self.max_radii2D[valid_points_mask]
 
+
     def prune_points(self, mask, iter):
         if iter > self.args.prune_from_iter:
             valid_points_mask = ~mask
@@ -361,6 +371,7 @@ class GaussianModel:
             self.denom = self.denom[valid_points_mask]
             self.max_radii2D = self.max_radii2D[valid_points_mask]
             self.confidence = self.confidence[valid_points_mask]
+
 
     def cat_tensors_to_optimizer(self, tensors_dict):
         optimizable_tensors = {}
@@ -413,8 +424,10 @@ class GaussianModel:
             self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
             self.confidence = torch.cat([self.confidence, torch.ones(new_opacities.shape, device="cuda")], 0)
 
-    def proximity(self, scene_extent, N=3):
+
+    def proximity(self, scene_extent, N = 3):
         dist, nearest_indices = distCUDA2(self.get_xyz)
+        self.nearest_distance = nearest_indices 
         selected_pts_mask = torch.logical_and(dist > (5. * scene_extent),
                                               torch.max(self.get_scaling, dim=1).values > (scene_extent))
 
@@ -430,6 +443,8 @@ class GaussianModel:
         new_opacity = self._opacity[new_indices]
         self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation)
 
+
+
     def densify_and_split(self, grads, grad_threshold, scene_extent, iter, N=2):
         n_init_points = self.get_xyz.shape[0]
         # Extract points that satisfy the gradient condition
@@ -442,11 +457,11 @@ class GaussianModel:
 
         dist, _ = distCUDA2(self.get_xyz)
         selected_pts_mask2 = torch.logical_and(dist > (self.args.dist_thres * scene_extent),
-                                               torch.max(self.get_scaling, dim=1).values > (scene_extent))
+                                               torch.max(self.get_scaling, dim=1).values > ( scene_extent))
         selected_pts_mask = torch.logical_or(selected_pts_mask, selected_pts_mask2)
 
         stds = self.get_scaling[selected_pts_mask].repeat(N, 1)
-        stds = torch.cat([stds, 0 * torch.ones_like(stds[:, :1])], dim=-1)
+        stds = torch.cat([stds, 0 * torch.ones_like(stds[:,:1])], dim=-1)
         means = torch.zeros_like(stds)
         samples = torch.normal(mean=means, std=stds)
         rots = build_rotation(self._rotation[selected_pts_mask]).repeat(N, 1, 1)
@@ -462,6 +477,7 @@ class GaussianModel:
         prune_filter = torch.cat(
             (selected_pts_mask, torch.zeros(N * selected_pts_mask.sum(), device="cuda", dtype=bool)))
         self.prune_points(prune_filter, iter)
+
 
     def densify_and_clone(self, grads, grad_threshold, scene_extent):
         # Extract points that satisfy the gradient condition
@@ -480,9 +496,18 @@ class GaussianModel:
         self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling,
                                    new_rotation)
 
-    def proximity_opt(self, scene_extent, N=3, opacity_threshold=0.03):
-        opacity_mask = self.get_opacity.squeeze() < opacity_threshold
+        
+    def proximity_opt(self, scene_extent, N = 3, opacity_threshold = 0.03):
+        opacity_values = self.get_opacity.squeeze()
+        opacity_np = opacity_values.cpu().detach().numpy().reshape(-1, 1)
+        gmm = GaussianMixture(n_components=2, random_state=0).fit(opacity_np)
+        means = gmm.means_.flatten() 
+        mu_low, mu_high = np.min(means), np.max(means)
+        t_opa = (mu_low + mu_high) / 2
+        # print("Computed opacity threshold (t_opa):", t_opa)
+        opacity_mask = self.get_opacity.squeeze() < t_opa
         dist, nearest_indices = distCUDA2(self.get_xyz)
+        self.nearest_distance = nearest_indices 
         selected_pts_mask = torch.logical_and(dist > (5. * scene_extent),
                                               torch.max(self.get_scaling, dim=1).values > (scene_extent))
         selected_pts_mask = torch.logical_and(selected_pts_mask, opacity_mask)
@@ -497,32 +522,75 @@ class GaussianModel:
         new_features_dc = torch.zeros_like(self._features_dc[new_indices])
         new_features_rest = torch.zeros_like(self._features_rest[new_indices])
         new_opacity = self._opacity[new_indices]
-
         self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation)
+    
 
     def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size, iter):
         grads = self.xyz_gradient_accum / self.denom
         grads[grads.isnan()] = 0.0
-
         self.densify_and_clone(grads, max_grad, extent)
         self.densify_and_split(grads, max_grad, extent, iter)
-
         if iter < 2000:
-            self.proximity(extent)
-
-        if iter > 2000 and iter < 4000:
             self.proximity_opt(extent)
-
         prune_mask = (self.get_opacity < min_opacity).squeeze()
         if max_screen_size:
             big_points_vs = self.max_radii2D > max_screen_size
             big_points_ws = self.get_scaling.max(dim=1).values > 0.1 * extent
             prune_mask = torch.logical_or(torch.logical_or(prune_mask, big_points_vs), big_points_ws)
-
         self.prune_points(prune_mask, iter)
         torch.cuda.empty_cache()
+
 
     def add_densification_stats(self, viewspace_point_tensor, update_filter):
         self.xyz_gradient_accum[update_filter] += torch.norm(viewspace_point_tensor.grad[update_filter, :2], dim=-1,
                                                              keepdim=True)
         self.denom[update_filter] += 1
+
+    def replace_tensors_to_optimizer(self, inds=None):
+        tensors_dict = {"xyz": self._xyz,
+                        "f_dc": self._features_dc,
+                        "f_rest": self._features_rest,
+                        "opacity": self._opacity,
+                        "scaling": self._scaling,
+                        "rotation": self._rotation}
+
+        optimizable_tensors = {}
+        for group in self.optimizer.param_groups:
+            assert len(group["params"]) == 1
+            tensor = tensors_dict[group["name"]]
+            stored_state = self.optimizer.state.get(group['params'][0], None)
+
+            if inds is not None:
+                stored_state["exp_avg"][inds] = 0
+                stored_state["exp_avg_sq"][inds] = 0
+            else:
+                stored_state["exp_avg"] = torch.zeros_like(tensor)
+                stored_state["exp_avg_sq"] = torch.zeros_like(tensor)
+
+            del self.optimizer.state[group['params'][0]]
+            group["params"][0] = nn.Parameter(tensor.requires_grad_(True))
+            self.optimizer.state[group['params'][0]] = stored_state
+
+            optimizable_tensors[group["name"]] = group["params"][0]
+
+        self._xyz = optimizable_tensors["xyz"]
+        self._features_dc = optimizable_tensors["f_dc"]
+        self._features_rest = optimizable_tensors["f_rest"]
+        self._opacity = optimizable_tensors["opacity"]
+        self._scaling = optimizable_tensors["scaling"]
+        self._rotation = optimizable_tensors["rotation"]
+
+        return optimizable_tensors
+
+    def _update_params(self, idxs, ratio):
+        new_opacity, new_scaling = compute_relocation_cuda(
+            opacity_old=self.get_opacity[idxs, 0],
+            scale_old=self.get_scaling[idxs],
+            N=ratio[idxs, 0] + 1
+        )
+        new_opacity = torch.clamp(new_opacity.unsqueeze(-1), max=1.0 - torch.finfo(torch.float32).eps, min=0.005)
+        new_opacity = self.inverse_opacity_activation(new_opacity)
+        new_scaling = self.scaling_inverse_activation(new_scaling.reshape(-1, 3))
+
+        return self._xyz[idxs], self._features_dc[idxs], self._features_rest[idxs], new_opacity, new_scaling, \
+        self._rotation[idxs]
