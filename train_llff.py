@@ -14,35 +14,39 @@ try:
 except ImportError:
     TENSORBOARD_FOUND = False
 
-import cv2
-import numpy as np
-import os
-import matplotlib.pyplot as plt
-import torch
-from torchmetrics import PearsonCorrCoef
-from torchmetrics.functional.regression import pearson_corrcoef
-from random import randint
-from utils.loss_utils import l1_loss, l1_loss_mask, l2_loss, patch_norm_mse_loss, ssim
-from depth_utils import estimate_depth
-from gaussian_renderer import render, network_gui
 import sys
+import os
+import uuid
+import numpy as np
+import matplotlib as plt
+from argparse import ArgumentParser, Namespace
+from random import randint
+import math
+import torch
+import torch.nn.functional as F
+from torchmetrics.functional.regression import pearson_corrcoef
+from tqdm import tqdm
+
+from utils.loss_utils import (
+    l1_loss,
+    l1_loss_mask,
+    patch_norm_mse_loss,
+    ssim,
+)
+from gaussian_renderer import render, network_gui
 from scene import Scene, GaussianModel
 from utils.general_utils import safe_state
-import uuid
-from tqdm import tqdm
 from utils.image_utils import psnr
-from argparse import ArgumentParser, Namespace
+from utils.normal_utils import stable_normal_prior_term
+from utils.consist_view import xview_reproj_depth_loss, quick_inb_ratio
 from arguments import ModelParams, PipelineParams, OptimizationParams
 from lpipsPyTorch import lpips
 from scene.gaussian_model import build_scaling_rotation
-
-import torch
-import cv2
-from depth_utils import estimate_depth
+from depth_utils import affine_align_1d, silog_from_logdiff
 from depth_anything_v2.dpt import DepthAnythingV2
 
-DEVICE = 'cuda' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu'
 
+DEVICE = 'cuda' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu'
 def load_depth_model(mode='vitl'):
     model_configs = {
         'vits': {'encoder': 'vits', 'features': 64, 'out_channels': [48, 96, 192, 384]},
@@ -57,12 +61,6 @@ def load_depth_model(mode='vitl'):
     return model
 depth_model = load_depth_model('vitl')
 
-def save_depth_image(depth, filename):
-    depth = depth.squeeze().detach().cpu().numpy()
-    depth = (depth - depth.min()) / (depth.max() - depth.min())  # Normalize to [0, 1]
-    depth = (depth * 255).astype(np.uint8)
-    plt.imsave(filename, depth, cmap='viridis')
-
 def training(dataset, opt, pipe, args, depth_model):
     testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from = args.test_iterations, \
             args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from
@@ -71,6 +69,8 @@ def training(dataset, opt, pipe, args, depth_model):
     gaussians = GaussianModel(args)
     scene = Scene(args, gaussians, shuffle=False, depth_model=depth_model)
     gaussians.training_setup(opt)
+
+    train_cams = scene.getTrainCameras()
     if checkpoint:
         (model_params, first_iter) = torch.load(checkpoint)
         gaussians.restore(model_params, opt)
@@ -79,14 +79,9 @@ def training(dataset, opt, pipe, args, depth_model):
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
 
-    iter_start = torch.cuda.Event(enable_timing=True)
-    iter_end = torch.cuda.Event(enable_timing=True)
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
 
     viewpoint_stack, pseudo_stack = None, None
-    
-    patch_range = (5, 17)
-    
     ema_loss_for_log = 0.0
     first_iter += 1
     for iteration in range(first_iter, opt.iterations + 1):
@@ -104,8 +99,8 @@ def training(dataset, opt, pipe, args, depth_model):
                     break
             except Exception as e:
                 network_gui.conn = None
-
-        xyz_lr = gaussians.update_learning_rate(iteration)
+        
+        gaussians.update_learning_rate(iteration)
 
         # Every 1000 its we increase the levels of SH up to a maximum degree
         if iteration % 500 == 0:
@@ -115,6 +110,31 @@ def training(dataset, opt, pipe, args, depth_model):
         if not viewpoint_stack:
             viewpoint_stack = scene.getTrainCameras().copy()
         viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack) - 1))
+
+
+        train_cams = scene.getTrainCameras()
+        if len(train_cams) >= 2:
+            centers_cpu = torch.stack([c.camera_center.detach().cpu() for c in train_cams], dim=0)
+            uid2idx = {c.uid: i for i, c in enumerate(train_cams)}
+
+            def sample_neighbor_cam(cam_i, k=8, min_rank=1):
+                ci = cam_i.camera_center.detach().cpu()
+                d2 = ((centers_cpu - ci[None, :]) ** 2).sum(dim=1)
+
+                i_idx = uid2idx.get(cam_i.uid, None)
+                if i_idx is not None:
+                    d2[i_idx] = 1e9
+
+                k_eff = min(k, len(train_cams) - 1)
+                nn = torch.topk(d2, k=k_eff, largest=False).indices
+
+                start = min(min_rank - 1, k_eff - 1)
+                pool = nn[start:]
+                j_idx = pool[torch.randint(0, pool.numel(), (1,)).item()].item()
+                return train_cams[j_idx]
+        else:
+            def sample_neighbor_cam(cam_i, k=8, min_rank=1):
+                return cam_i
 
         # Render
         if (iteration - 1) == debug_from:
@@ -128,27 +148,20 @@ def training(dataset, opt, pipe, args, depth_model):
 
         Ll1 =  l1_loss_mask(image, gt_image)
         loss = ((1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image)))
-
+        
         # regularization
         lambda_normal = opt.lambda_normal if iteration > 2000 else 0.0
-
         rend_normal  = render_pkg['rend_normal']
         surf_normal = render_pkg['surf_normal']
         normal_error = (1 - (rend_normal * surf_normal).sum(dim=0))[None]
         normal_loss = lambda_normal * (normal_error).mean()
-        loss = loss + normal_loss
 
+        loss = loss + normal_loss
+        # if iteration < 2000:
         loss = loss + args.opacity_reg * torch.abs(gaussians.get_opacity).mean()
 
         rendered_depth = render_pkg["depth"][0]
         midas_depth = torch.tensor(viewpoint_cam.depth_image).cuda().squeeze()
-        max_depth_value = rendered_depth.max()
-        rendered_depth_inverted = max_depth_value - rendered_depth
-        # print(
-        #     f"Iteration {iteration}: midas_depth shape: {midas_depth.shape}, rendered_depth shape: {rendered_depth.shape}")
-        if iteration % 1000 == 0:
-            save_depth_image(midas_depth, f'midas_depth_{iteration}.png')
-            save_depth_image(rendered_depth_inverted, f'rendered_depth_{iteration}.png')
 
         # Ensure both depths have the same dimensions
         midas_depth_resized = torch.nn.functional.interpolate(
@@ -160,18 +173,104 @@ def training(dataset, opt, pipe, args, depth_model):
 
         rendered_depth = rendered_depth.reshape(-1, 1)
         midas_depth_t = midas_depth_resized.reshape(-1, 1)
+
         depth_loss = min(
             (1 - pearson_corrcoef(-midas_depth_t, rendered_depth)),
             (1 - pearson_corrcoef(1 / (midas_depth_t + 200.), rendered_depth))
         )
         loss += args.depth_weight * depth_loss
-  
+
+        if iteration > args.end_sample_pseudo:
+            args.depth_weight = 0.001
+
+        patch_range = (5, 17)
         depth_n = render_pkg["depth"][0].unsqueeze(0)
         anyth_n = midas_depth.unsqueeze(0)
         anyth_n = 255.0 - anyth_n
-        
         loss_l2_dpt = patch_norm_mse_loss(depth_n[None,...], anyth_n[None,...], randint(patch_range[0], patch_range[1]), opt.error_tolerance)
-        loss += 0.01 * loss_l2_dpt
+        loss += 0.03 * loss_l2_dpt   
+
+
+        # ===== Module-1: cross-view reprojection consistency =====
+        train_cams = scene.getTrainCameras()
+        if len(train_cams) >= 2:
+            centers_cpu = torch.stack([c.camera_center.detach().cpu() for c in train_cams], dim=0)  # [N,3]
+            uid2idx = {c.uid: i for i, c in enumerate(train_cams)}
+
+            def sample_neighbor_cam(cam_i, k=8, min_rank=2):
+                ci = cam_i.camera_center.detach().cpu()
+                d2 = ((centers_cpu - ci[None, :]) ** 2).sum(dim=1)
+
+                # 排除自身
+                i_idx = uid2idx.get(cam_i.uid, None)
+                if i_idx is not None:
+                    d2[i_idx] = 1e9
+
+                k_eff = min(k, len(train_cams) - 1)
+                nn = torch.topk(d2, k=k_eff, largest=False).indices  # 距离从近到远
+
+                # 跳过最接近的 (min_rank-1) 个，避免“几乎同视角”
+                start = min(min_rank - 1, k_eff - 1)
+                pool = nn[start:]
+                j_idx = pool[torch.randint(0, pool.numel(), (1,)).item()].item()
+                return train_cams[j_idx]
+
+        else:
+            def sample_neighbor_cam(cam_i, k=10):
+                return cam_i
+        
+        if iteration > 2000:
+            # 建议：min_rank=1，让最近邻也可选（你已经排除了自身 uid）
+            k_nn = 6
+            tries = 5
+            accept_th = 0.2   # 达标就用
+            skip_th   = 0.10   # 低于这个直接跳过 xview（避免噪声梯度）
+
+            best_cam = None
+            best_r = -1.0
+
+            # 先用 pkg_i 做 quick overlap 预检，不渲染 cand
+            for t in range(tries):
+                cand = sample_neighbor_cam(viewpoint_cam, k=k_nn, min_rank=1)
+                r = quick_inb_ratio(viewpoint_cam, render_pkg, cand, n=512, alpha_th=0.2)
+
+                if r > best_r:
+                    best_r = r
+                    best_cam = cand
+
+                if r >= accept_th:
+                    best_cam = cand
+                    break
+
+            if iteration % 2000 == 0:
+                print(f"[xview_pick@{iteration}] best_inb_pre={best_r:.3f} accept_th={accept_th:.2f}")
+
+            # 不达标：跳过本轮 xview（比“硬算一个很差的 xview”更稳）
+            if best_cam is None or best_r < skip_th:
+                loss_xview = None
+            else:
+                cam_j = best_cam
+                # 真正需要时再 render cam_j
+                pkg_j = render(cam_j, gaussians, pipe, background)
+                loss_xview = xview_reproj_depth_loss(
+                    viewpoint_cam, render_pkg,
+                    cam_j, pkg_j,
+                    tau_rel=0.04,
+                    alpha_th=1e-3,
+                    n_samples=8192,
+                    detach_j=False,
+                    debug=(iteration % 2000 == 0),
+                    debug_prefix=f"xview@{iteration}",
+                )
+
+            if loss_xview is not None:
+                q_inb = (best_r - skip_th) / (accept_th - skip_th + 1e-6)
+                q_inb = float(max(0.0, min(1.0, q_inb)))
+                xw = min(1.0, (iteration - 2000) / 2000.0)
+                photo_ref = Ll1.detach()
+                w_dyn = (0.1 * photo_ref / (loss_xview.detach() + 1e-6)).clamp(0.0, 2.0)
+                w_eff = xw * w_dyn * (q_inb ** 2)
+                # loss = loss + w_eff * loss_xview
 
         loss.backward()
 
@@ -211,30 +310,6 @@ def training(dataset, opt, pipe, args, depth_model):
             if iteration < opt.iterations:
                 gaussians.optimizer.step()
                 gaussians.optimizer.zero_grad(set_to_none = True)
-  
-                def get_dynamic_noise_scale(iteration, min_value=0.0001, max_value=0.005, max_iter=2000):
-                    progress = min(1 , iteration / max_iter)
-                    return min_value + (max_value - min_value) * progress    
-                
-                L = build_scaling_rotation(
-    torch.cat([gaussians.get_scaling , torch.ones_like(gaussians.get_scaling)], dim=-1), gaussians.get_rotation).permute(0, 2, 1)
-
-                actual_covariance = L @ L.transpose(1, 2)
-
-                def op_sigmoid(x, k=100, x0=0.995):
-                    return 1 / (1 + torch.exp(-k * (x - x0)))
-
-                noise_scale = get_dynamic_noise_scale(iteration, min_value=0.001, max_value=0.02, max_iter=8500)
-            
-                noise = torch.randn_like(gaussians._xyz) * (
-                    op_sigmoid(1 - gaussians.get_opacity)) * xyz_lr * args.noise_lr
-                
-                noise = torch.bmm(actual_covariance, noise.unsqueeze(-1)).squeeze(-1)
-                gaussians._xyz.add_(noise)
-                
-                
-                # if iteration % 1000 == 0:
-                #     print(f"After adding noise, gaussians._xyz: {gaussians._xyz}")
 
             gaussians.update_learning_rate(iteration)
             if (iteration - args.start_sample_pseudo - 1) % opt.opacity_reset_interval == 0 and \
@@ -322,17 +397,12 @@ if __name__ == "__main__":
     parser.add_argument('--port', type=int, default=6009)
     parser.add_argument('--debug_from', type=int, default=-1)
     parser.add_argument('--detect_anomaly', action='store_true', default=False)
-
-    parser.add_argument("--test_iterations", nargs="+", type=int, default=[5000,9000])
-    parser.add_argument("--save_iterations", nargs="+", type=int, default=[9000])
+    parser.add_argument("--test_iterations", nargs="+", type=int, default=[5000, 9000])
+    parser.add_argument("--save_iterations", nargs="+", type=int, default=[5000, 9000])
     parser.add_argument("--quiet", action="store_true")
-    parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[9000])
+    parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[5000, 9000])
     parser.add_argument("--start_checkpoint", type=str, default = None)
     parser.add_argument("--train_bg", action="store_true")
-    parser.add_argument("--c2f", action="store_true", default=False)
-    parser.add_argument("--c2f_every_step", type=float, default=1000,
-                        help="Recompute low pass filter size for every c2f_every_step iterations")
-    parser.add_argument("--c2f_max_lowpass", type=float, default=300, help="Maximum low pass filter size")
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
 
