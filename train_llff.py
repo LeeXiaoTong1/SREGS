@@ -270,7 +270,7 @@ def training(dataset, opt, pipe, args, depth_model):
                 photo_ref = Ll1.detach()
                 w_dyn = (0.1 * photo_ref / (loss_xview.detach() + 1e-6)).clamp(0.0, 2.0)
                 w_eff = xw * w_dyn * (q_inb ** 2)
-                # loss = loss + w_eff * loss_xview
+                loss = loss + w_eff * loss_xview
 
         loss.backward()
 
